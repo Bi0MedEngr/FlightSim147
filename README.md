@@ -25,6 +25,9 @@ A procedurally generated voxel-terrain flight sim (Comanche-style) for the **Wav
 
 The first install still needs USB, because firmware without the updater can't receive updates over Wi-Fi.
 
+## Play the browser demo
+**https://bi0medengr.github.io/FlightSim147/demo.html** runs the same engine, ported to JavaScript. Steer by dragging, with the arrow keys, or by tilting your phone.
+
 ## Flash from your browser (no IDE)
 **https://bi0medengr.github.io/FlightSim147/** works in Chrome on Android (v148+) or desktop Chrome/Edge. Plug in the board and tap Install.
 
