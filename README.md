@@ -32,6 +32,8 @@ The first install still needs USB, because firmware without the updater can't re
 ## Play the browser demo
 **https://bi0medengr.github.io/FlightSim147/demo.html** runs the same engine, ported to JavaScript. Steer by dragging, with the arrow keys, or by tilting your phone.
 
+It also has a **Dogfight** mode (browser only for now): waves of bandits, machine guns with tracers, lock-on homing missiles, explosions, a radar and health. Keys: Space = guns, M = missile, F = start or stop the dogfight.
+
 ## Flash from your browser (no IDE)
 **https://bi0medengr.github.io/FlightSim147/** works in Chrome on Android (v148+) or desktop Chrome/Edge. Plug in the board and tap Install.
 
