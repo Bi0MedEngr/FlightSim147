@@ -25,8 +25,8 @@ jobs:
           arduino-cli config init
           arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
           arduino-cli core update-index
-          arduino-cli core install esp32:esp32
-          arduino-cli lib install "GFX Library for Arduino"
+          arduino-cli core install esp32:esp32@3.3.13   # pinned: core 4.0.0 breaks Arduino_GFX
+          arduino-cli lib install "GFX Library for Arduino@1.6.9..."
 
       - name: Compile ESP32-S3 (Waveshare ESP32-S3-LCD-1.47)
         run: |

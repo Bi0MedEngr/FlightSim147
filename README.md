@@ -31,7 +31,7 @@ The first install still needs USB, because firmware without the updater can't re
 The prebuilt merged images are also on the [latest release](../../releases/tag/latest). Flash them at offset `0x0`.
 
 ## Build it yourself
-1. Install the **esp32 by Espressif** core (3.x) and the **GFX Library for Arduino** (moononournation).
+1. Install the **esp32 by Espressif** core **3.3.x** (4.0.0 currently breaks the GFX library) and the **GFX Library for Arduino** (moononournation).
 2. Open `FlightSim147/FlightSim147.ino` and choose your board `#define` at the top.
 3. ESP32-S3: Tools → USB CDC On Boot → Enabled. Then upload.
 
