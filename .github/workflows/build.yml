@@ -36,6 +36,7 @@ jobs:
           arduino-cli compile --fqbn "esp32:esp32:esp32s3:CDCOnBoot=cdc" \
             --output-dir build-s3 FlightSim147
           cp build-s3/FlightSim147.ino.merged.bin out/flightsim-esp32s3.bin
+          cp build-s3/FlightSim147.ino.bin out/flightsim-esp32s3-ota.bin
 
       - name: Compile ESP32-C6 (Waveshare ESP32-C6-LCD-1.47)
         run: |
@@ -44,6 +45,7 @@ jobs:
           arduino-cli compile --fqbn "esp32:esp32:esp32c6:CDCOnBoot=cdc" \
             --output-dir build-c6 c6
           cp build-c6/c6.ino.merged.bin out/flightsim-esp32c6.bin
+          cp build-c6/c6.ino.bin out/flightsim-esp32c6-ota.bin
 
       - name: Assemble web flasher site
         run: |
@@ -59,7 +61,7 @@ jobs:
         run: |
           gh release delete latest -y --cleanup-tag || true
           gh release create latest out/*.bin --title "Latest build (${GITHUB_SHA::7})" \
-            --notes "Merged images — flash at offset 0x0." --target "$GITHUB_SHA"
+            --notes "flightsim-<chip>.bin: full image, flash at 0x0 (USB / web flasher). flightsim-<chip>-ota.bin: upload through the on-device Wi-Fi updater (hold BOOT 4 s)." --target "$GITHUB_SHA"
 
       - uses: actions/upload-pages-artifact@v3
         with:
