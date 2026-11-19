@@ -6,6 +6,8 @@ A procedurally generated voxel-terrain flight sim (Comanche-style) for the **Wav
 
 - Each boot, or each press of **BOOT**, generates a new 256×256 wrapping island world with lakes, beaches, forest, rock and snow.
 - An autopilot banks through turns and follows the terrain. It also has distance fog, a tilted horizon, and an ALT/HDG/FPS HUD.
+- **Four aircraft** (jet, prop plane, biplane, helicopter), each with its own speed, handling and cruise height.
+- **Chase view** (third person) or **cockpit view**.
 - **Tilt-to-fly** on the ESP32-S3-LCD-1.47B. Its QMI8658 IMU is auto-detected.
 - **Wi-Fi updater** for flashing without a cable, e.g. from an iPhone.
 - Optional analog-joystick steering (`#define USE_JOYSTICK`).
@@ -13,7 +15,9 @@ A procedurally generated voxel-terrain flight sim (Comanche-style) for the **Wav
 ## BOOT button
 | Action | Result |
 |---|---|
-| Tap | New procedurally generated world |
+| 1 tap | Next aircraft: jet → prop plane → biplane → helicopter |
+| 2 taps | Toggle chase (3rd-person) / cockpit view |
+| 3 taps | New procedurally generated world |
 | Hold ~1 s | Toggle tilt-to-fly / autopilot (1.47B only). Also sets "level" to how you're holding it |
 | Hold 4 s | Wi-Fi updater mode |
 

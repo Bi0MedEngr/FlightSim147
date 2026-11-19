@@ -4,7 +4,9 @@
 // Board:   ESP32 Arduino core 3.x
 //
 // BOOT button:
-//   tap            → fly over a brand-new procedurally generated world
+//   1 tap          → next aircraft (jet, prop, biplane, helicopter)
+//   2 taps         → toggle chase (3rd person) / cockpit view
+//   3 taps         → fly over a brand-new procedurally generated world
 //   hold ~1 s      → toggle tilt-to-fly / autopilot (boards with an IMU, e.g. 1.47B);
 //                    also re-centres "level" to however you're holding it
 //   hold 4 s       → Wi-Fi updater: join Wi-Fi "FlightSim147", open http://192.168.4.1
@@ -76,6 +78,8 @@ uint32_t lastMs;
 float fpsAvg = 0;
 
 bool tiltMode = false;
+bool chaseView = true;
+int aircraftType = 1;
 float tiltX0 = 0, tiltY0 = 0;      // neutral angles (rad)
 float tiltX = 0, tiltY = 0;        // filtered stick values
 
@@ -134,6 +138,7 @@ static void newWorld() {
   message("Generating", buf);
   fs::generateWorld(worldSeed);
   plane = fs::Plane();
+  plane.type = aircraftType;
   plane.rng = worldSeed | 1;
   plane.x = (worldSeed >> 8) & fs::MAP_MASK;
   plane.y = (worldSeed >> 16) & fs::MAP_MASK;
@@ -182,20 +187,33 @@ void setup() {
 void loop() {
   // ---- button handling ----
   static bool btnPrev = true;
-  static uint32_t pressMs = 0;
+  static uint32_t pressMs = 0, lastTapMs = 0;
+  static int taps = 0;
   bool btn = digitalRead(BTN_PIN);           // LOW = pressed
   uint32_t now = millis();
   if (btnPrev && !btn) pressMs = now;
   if (!btn && mode == FLY && now - pressMs > 4000) startUpdater();
   if (!btnPrev && btn && mode == FLY) {      // released
     uint32_t held = now - pressMs;
-    if (held < 600) newWorld();
-    else if (imu::present) {
+    if (held < 600) { taps++; lastTapMs = now; }
+    else if (held < 4000 && imu::present) {
+      taps = 0;
       tiltMode = !tiltMode;
       if (tiltMode) recentreTilt();
     }
   }
   btnPrev = btn;
+  if (taps && btn && now - lastTapMs > 400) {   // tap sequence finished
+    if (taps == 1) {
+      aircraftType = (aircraftType + 1) % fs::NUM_AIRCRAFT;
+      plane.type = aircraftType;
+    } else if (taps == 2) {
+      chaseView = !chaseView;
+    } else {
+      newWorld();
+    }
+    taps = 0;
+  }
 
   if (mode == UPDATER) {
     ota::loop();
@@ -238,8 +256,7 @@ void loop() {
   }
 
   uint16_t *fb = gfx->getFramebuffer();
-  fs::render(plane, fb);
-  fs::drawReticle(fb);
+  fs::drawFrame(plane, chaseView, fb);
 
   // HUD
   if (dt > 0) fpsAvg += ((1.0f / dt) - fpsAvg) * 0.1f;
@@ -254,6 +271,8 @@ void loop() {
   gfx->printf("%2d FPS", (int)(fpsAvg + 0.5f));
   gfx->setCursor(fs::W - 46, 14);
   gfx->print(tiltMode ? "TILT" : "AUTO");
+  gfx->setCursor(4, fs::H - 11);
+  gfx->print(fs::AIRCRAFT[aircraftType].name);
 
   gfx->flush();
 }
