@@ -1,0 +1,76 @@
+name: Build firmware & web flasher
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: arduino/setup-arduino-cli@v2
+
+      - name: Install ESP32 core + Arduino_GFX
+        run: |
+          arduino-cli config init
+          arduino-cli config add board_manager.additional_urls https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          arduino-cli core update-index
+          arduino-cli core install esp32:esp32
+          arduino-cli lib install "GFX Library for Arduino"
+
+      - name: Compile ESP32-S3 (Waveshare ESP32-S3-LCD-1.47)
+        run: |
+          mkdir -p out
+          arduino-cli compile --fqbn "esp32:esp32:esp32s3:CDCOnBoot=cdc" \
+            --output-dir build-s3 FlightSim147
+          cp build-s3/FlightSim147.ino.merged.bin out/flightsim-esp32s3.bin
+
+      - name: Compile ESP32-C6 (Waveshare ESP32-C6-LCD-1.47)
+        run: |
+          rm -rf c6 && cp -r FlightSim147 c6 && mv c6/FlightSim147.ino c6/c6.ino
+          sed -i 's|^#define BOARD_WAVESHARE_ESP32S3_LCD_147|// #define BOARD_WAVESHARE_ESP32S3_LCD_147|; s|^// #define BOARD_WAVESHARE_ESP32C6_LCD_147|#define BOARD_WAVESHARE_ESP32C6_LCD_147|' c6/c6.ino
+          arduino-cli compile --fqbn "esp32:esp32:esp32c6:CDCOnBoot=cdc" \
+            --output-dir build-c6 c6
+          cp build-c6/c6.ino.merged.bin out/flightsim-esp32c6.bin
+
+      - name: Assemble web flasher site
+        run: |
+          mkdir -p site
+          cp web/* site/
+          cp out/*.bin site/
+          cp preview.png site/
+          sed -i "s/__VERSION__/${GITHUB_SHA::7}/" site/manifest.json
+
+      - name: Publish "latest" release with .bin files
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete latest -y --cleanup-tag || true
+          gh release create latest out/*.bin --title "Latest build (${GITHUB_SHA::7})" \
+            --notes "Merged images — flash at offset 0x0." --target "$GITHUB_SHA"
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
