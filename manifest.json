@@ -1,0 +1,15 @@
+{
+  "name": "FlightSim147",
+  "version": "de4d967",
+  "new_install_prompt_erase": true,
+  "builds": [
+    {
+      "chipFamily": "ESP32-S3",
+      "parts": [{ "path": "flightsim-esp32s3.bin", "offset": 0 }]
+    },
+    {
+      "chipFamily": "ESP32-C6",
+      "parts": [{ "path": "flightsim-esp32c6.bin", "offset": 0 }]
+    }
+  ]
+}

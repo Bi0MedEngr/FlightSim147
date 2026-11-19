@@ -1,0 +1,872 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FlightSim147 — Browser Demo</title>
+<style>
+  :root { --bg:#0d1b2a; --panel:#152638; --fg:#e0e6ee; --dim:#8fa3b8; --acc:#4caf50; --red:#d84a3a; }
+  * { box-sizing:border-box; }
+  html,body { margin:0; background:var(--bg); color:var(--fg); font-family:system-ui,-apple-system,sans-serif; }
+  main { max-width:760px; margin:0 auto; padding:16px; }
+  h1 { font-size:1.3rem; margin:4px 0 2px; }
+  .sub { color:var(--dim); margin:0 0 14px; font-size:.92rem; }
+  .bezel { background:#05080c; border-radius:14px; padding:12px; box-shadow:0 6px 24px rgba(0,0,0,.4); }
+  canvas { display:block; width:100%; aspect-ratio:320/172; image-rendering:pixelated; image-rendering:crisp-edges;
+           border-radius:4px; touch-action:none; cursor:grab; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin:12px 0 0; }
+  button { flex:1 1 auto; font:inherit; font-size:.95rem; padding:11px 14px; border-radius:8px; border:0;
+           background:var(--panel); color:var(--fg); cursor:pointer; user-select:none; -webkit-user-select:none; touch-action:manipulation; }
+  button.on { background:var(--acc); color:#fff; }
+  button.fight.on { background:var(--red); }
+  #weapons { display:none; }
+  #weapons button { font-size:1.1rem; font-weight:600; padding:16px; background:#3a1d1d; }
+  #weapons button:active, #weapons button.held { background:var(--red); }
+  .help { color:var(--dim); font-size:.85rem; line-height:1.5; margin-top:14px; }
+  .help b { color:var(--fg); }
+  a { color:#7ec8ff; }
+</style>
+</head>
+<body>
+<main>
+  <h1>FlightSim147 — browser demo</h1>
+  <p class="sub">The same procedural voxel engine as the ESP32 firmware, at the panel's 320×172 resolution and RGB565 colour.</p>
+  <div class="bezel"><canvas id="c" width="320" height="172"></canvas></div>
+  <div class="row" id="weapons">
+    <button id="fire">GUNS</button>
+    <button id="missile">MISSILE</button>
+  </div>
+  <div class="row"><button id="fight" class="fight">⚔ Dogfight</button></div>
+  <div class="row" id="craft"></div>
+  <div class="row">
+    <button id="view" class="on">Chase view</button>
+    <button id="newWorld">New world</button>
+    <button id="tilt">Tilt to fly</button>
+    <button id="auto" class="on">Autopilot</button>
+  </div>
+  <p class="help">
+    <b>Drag</b> on the screen to steer: left/right to bank, up to climb, down to dive. Or use the <b>arrow keys</b>.
+    Pick an <b>aircraft</b> and switch between the <b>chase</b> and <b>cockpit</b> views (keys 1–4 and V).
+    <b>Tilt to fly</b> uses your phone's motion sensor, just like the 1.47B board. Hold the phone how you like, then tap it to set level.
+    Let go and the autopilot takes over again.
+  </p>
+  <p class="help">
+    <b>Dogfight:</b> shoot down each wave of red bandits. Guns fire automatically when a bandit is in your sights; hold <b>GUNS</b> (or Space) to fire anyway.
+    Keep a bandit near the centre until the box turns red and says <b>LOCK</b>, then fire a <b>MISSILE</b> (M key). You carry 4, and they reload over time.
+    Let go of the controls and the autopilot will chase the nearest bandit for you.
+  </p>
+  <p class="help"><a href="https://bi0medengr.github.io/FlightSim147/">← Install it on your board</a> · <a href="https://github.com/Bi0MedEngr/FlightSim147">Source on GitHub</a></p>
+</main>
+<script>
+"use strict";
+// =====================================================================
+//  Engine — port of flightsim_engine.h (plus a depth buffer for sprites)
+// =====================================================================
+const W = 320, H = 172, MAP_BITS = 8, MAP = 1 << MAP_BITS, MAP_MASK = MAP - 1;
+const DIST = 520, HSCALE = 85, WATER = 70, FOG_LEVELS = 16;
+const SKY_R = 120, SKY_G = 170, SKY_B = 225;
+
+const hmap = new Uint8Array(MAP * MAP), cmap = new Uint8Array(MAP * MAP);
+const fogLUT = []; for (let f = 0; f < FOG_LEVELS; f++) fogLUT.push(new Uint32Array(256));
+const skyLUT = new Uint32Array(256);
+const zbuf = new Uint8Array(W * H);          // depth: z/2, 255 = sky
+
+// pack as RGBA (little-endian ABGR), quantised through RGB565 like the real panel
+function rgb(r, g, b) {
+  r = Math.max(0, Math.min(255, r | 0)); g = Math.max(0, Math.min(255, g | 0)); b = Math.max(0, Math.min(255, b | 0));
+  r &= 0xF8; g &= 0xFC; b &= 0xF8; r |= r >> 5; g |= g >> 6; b |= b >> 5;
+  return (0xFF000000 | (b << 16) | (g << 8) | r) >>> 0;
+}
+function hash3(x, y, s) {
+  let h = (Math.imul(x, 374761393) + Math.imul(y, 668265263) + Math.imul(s, 2246822519 | 0)) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+const lattice = (x, y, p, s) => (hash3(x & (p - 1), y & (p - 1), s) & 0xFFFF) / 65535;
+const smooth = t => t * t * (3 - 2 * t);
+function vnoise(px, py, cells, seed) {
+  const cs = MAP / cells, fx = px / cs, fy = py / cs;
+  const ix = Math.floor(fx), iy = Math.floor(fy), tx = smooth(fx - ix), ty = smooth(fy - iy);
+  const a = lattice(ix, iy, cells, seed), b = lattice(ix + 1, iy, cells, seed);
+  const c = lattice(ix, iy + 1, cells, seed), d = lattice(ix + 1, iy + 1, cells, seed);
+  const top = a + (b - a) * tx, bot = c + (d - c) * tx;
+  return top + (bot - top) * ty;
+}
+const MAT_RGB = [[20,60,140],[40,110,180],[214,196,140],[86,150,60],[40,95,45],[120,110,100],[240,245,250],[150,150,70]];
+const M_DEEP=0, M_SHALLOW=1, M_SAND=2, M_GRASS=3, M_FOREST=4, M_ROCK=5, M_SNOW=6, M_DRYGRASS=7;
+
+function buildPalettes() {
+  for (let f = 0; f < FOG_LEVELS; f++) {
+    let fa = f / (FOG_LEVELS - 1); fa = fa * fa * 0.9;
+    for (let i = 0; i < 256; i++) {
+      const m = (i >> 5) & 7, s = i & 31, br = 0.45 + s * (0.85 / 31);
+      let r = MAT_RGB[m][0] * br, g = MAT_RGB[m][1] * br, b = MAT_RGB[m][2] * br;
+      r += (SKY_R - r) * fa; g += (SKY_G - g) * fa; b += (SKY_B - b) * fa;
+      fogLUT[f][i] = rgb(r, g, b);
+    }
+  }
+  for (let i = 0; i < 256; i++) {
+    const t = (i / 255) ** 2;
+    skyLUT[i] = rgb(35 + (SKY_R + 40 - 35) * t, 80 + (SKY_G + 35 - 80) * t, 170 + (SKY_B + 25 - 170) * t);
+  }
+}
+function fogAmount(z) {
+  if (z <= DIST * 0.3) return 0;
+  let fa = Math.min(1, (z - DIST * 0.3) / (DIST * 0.7));
+  return fa * fa * 0.9;
+}
+function fogged(c, z) {
+  const fa = fogAmount(z);
+  return rgb(c[0] + (SKY_R - c[0]) * fa, c[1] + (SKY_G - c[1]) * fa, c[2] + (SKY_B - c[2]) * fa);
+}
+
+function generateWorld(seed) {
+  const cells = [4, 8, 16, 32, 64], amp = [1, 0.5, 0.25, 0.12, 0.06];
+  const total = amp.reduce((a, b) => a + b);
+  for (let y = 0; y < MAP; y++) for (let x = 0; x < MAP; x++) {
+    let n = 0;
+    for (let o = 0; o < 5; o++) n += vnoise(x, y, cells[o], (seed + o * 101) >>> 0) * amp[o];
+    n /= total; n = (n - 0.25) / 0.6; n = Math.max(0, Math.min(1, n)); n = Math.pow(n, 1.7);
+    hmap[y * MAP + x] = (n * 225) | 0;
+  }
+  for (let y = 0; y < MAP; y++) for (let x = 0; x < MAP; x++) {
+    const h = hmap[y * MAP + x], hn = hmap[((y + 1) & MAP_MASK) * MAP + ((x + 1) & MAP_MASK)];
+    const r = hash3(x, y, (seed ^ 0xABCD) >>> 0), jit = (r & 15) - 8;
+    let m;
+    if (h < WATER - 18) m = M_DEEP;
+    else if (h < WATER) m = M_SHALLOW;
+    else if (h < WATER + 5 + (jit >> 2)) m = M_SAND;
+    else if (h < 120 + jit) m = ((r >>> 8) & 7) === 0 ? M_DRYGRASS : M_GRASS;
+    else if (h < 165 + jit) m = M_FOREST;
+    else if (h < 190 + jit) m = M_ROCK;
+    else m = M_SNOW;
+    let shade;
+    if (m <= M_SHALLOW) shade = 18 + ((r >>> 4) & 3);
+    else shade = Math.max(0, Math.min(31, 18 + (h - hn) * 2 + ((r >>> 12) & 3) - 1));
+    cmap[y * MAP + x] = m * 32 + shade;
+  }
+  for (let i = 0; i < MAP * MAP; i++) if (hmap[i] < WATER) hmap[i] = WATER;
+}
+const groundAt = (x, y) => hmap[((Math.floor(y)) & MAP_MASK) * MAP + ((Math.floor(x)) & MAP_MASK)];
+const wrapD = d => d - Math.round(d / MAP) * MAP;                      // shortest delta on the torus
+const wrapA = a => a - Math.round(a / (2 * Math.PI)) * 2 * Math.PI;    // angle to -pi..pi
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+
+// ---------- aircraft (rear-view silhouettes; n=-1 → ellipse cx,cy,rx,ry) ----------
+const M4 = (c, q) => [[c, 4, q], [c, 4, q.map((v, i) => (i % 2 ? v : -v))]];
+const SH = (c, n, q) => [[c, n, q]];
+const JET = [
+  ...M4([150,158,170], [-4,0, -34,6, -34,8, -4,4]),
+  ...M4([120,128,140], [-3,-2, -14,0, -14,2, -3,1]),
+  ...SH([90,98,110], 4, [-1.5,-3, -1,-17, 1,-17, 1.5,-3]),
+  ...SH([130,138,150], -1, [0,0, 5.5,5]),
+  ...SH([255,120,30], -1, [0,0.5, 3,3]),
+  ...SH([255,230,120], -1, [0,0.5, 1.6,1.6]),
+];
+const PROP = [
+  ...SH([235,235,235], 4, [-40,-3, 40,-3, 40,0, -40,0]),
+  ...M4([200,40,40], [-40,-3, -34,-3, -34,0, -40,0]),
+  ...SH([225,225,225], 4, [-12,-6, 12,-6, 12,-4, -12,-4]),
+  ...SH([200,40,40], 4, [-1,-5, -0.5,-17, 1.5,-17, 1.5,-5]),
+  ...SH([245,245,245], -1, [0,-2.5, 4.5,5]),
+  ...SH([60,60,70], -1, [0,-4, 2.5,1.5]),
+];
+const BIPLANE = [
+  ...SH([225,185,40], 4, [-30,2, 30,2, 30,5, -30,5]),
+  ...SH([80,60,40], 4, [-19,-10, -17,-10, -17,3, -19,3]),
+  ...SH([80,60,40], 4, [17,-10, 19,-10, 19,3, 17,3]),
+  ...SH([80,60,40], 4, [-6,-10, -4,-10, -4,0, -6,0]),
+  ...SH([80,60,40], 4, [4,-10, 6,-10, 6,0, 4,0]),
+  ...SH([245,205,60], 4, [-30,-13, 30,-13, 30,-10, -30,-10]),
+  ...SH([225,185,40], 4, [-10,-5, 10,-5, 10,-3, -10,-3]),
+  ...SH([190,50,40], 4, [-1,-5, -0.5,-16, 1.5,-16, 1.5,-5]),
+  ...SH([200,60,45], -1, [0,-1, 5,6]),
+];
+const HELI = [
+  ...SH([190,195,200], -1, [0,-15, 40,1.6]),
+  ...SH([60,60,60], 4, [-1,-15, 1,-15, 1,-9, -1,-9]),
+  ...SH([50,50,50], 4, [-10,6, 10,6, 10,7, -10,7]),
+  ...SH([50,50,50], 4, [-9,3, -7,3, -7,7, -9,7]),
+  ...SH([50,50,50], 4, [7,3, 9,3, 9,7, 7,7]),
+  ...SH([40,90,60], -1, [0,-3, 9,7.5]),
+  ...SH([30,70,45], -1, [0,-2, 2.5,2.5]),
+  ...SH([150,150,150], 4, [4,-8, 5,-8, 5,4, 4,4]),
+];
+const AIRCRAFT = [
+  { name: 'JET',     speed: 70, maxTurn: 0.9, turnResp: 1.6, bank: 0.55, clearance: 55, climb: 60, spriteBank: 2.0, shapes: JET },
+  { name: 'PROP',    speed: 34, maxTurn: 0.7, turnResp: 1.2, bank: 0.55, clearance: 38, climb: 40, spriteBank: 2.2, shapes: PROP },
+  { name: 'BIPLANE', speed: 24, maxTurn: 1.0, turnResp: 1.4, bank: 0.60, clearance: 28, climb: 30, spriteBank: 2.4, shapes: BIPLANE },
+  { name: 'HELI',    speed: 18, maxTurn: 1.2, turnResp: 2.0, bank: 0.25, clearance: 20, climb: 35, spriteBank: 1.2, shapes: HELI },
+];
+const BANDIT_TINT = [200, 35, 35];
+
+function newPlane(seed, type) {
+  const p = { x: (seed >>> 8) & MAP_MASK, y: (seed >>> 16) & MAP_MASK, alt: 150, heading: 0, type, speedMul: 1,
+              turnRate: 0, turnTarget: 0, turnTimer: 0, roll: 0, vs: 0, horizon: H * 0.38, rng: (seed | 1) >>> 0 };
+  p.alt = groundAt(p.x, p.y) + 60;
+  p.altCmd = p.alt;
+  return p;
+}
+function frand(p) { p.rng = (Math.imul(p.rng, 1664525) + 1013904223) >>> 0; return (p.rng >>> 8) / 16777216; }
+const fwd = p => [-Math.sin(p.heading), -Math.cos(p.heading)];
+const speedOf = p => AIRCRAFT[p.type].speed * p.speedMul;
+
+// shared flight physics: steer toward a turn rate and an altitude
+function flyPlane(p, dt, turnTarget, altTarget, floor) {
+  const a = AIRCRAFT[p.type];
+  p.turnTarget = clamp(turnTarget, -a.maxTurn, a.maxTurn);
+  p.turnRate += (p.turnTarget - p.turnRate) * (1 - Math.exp(-dt * a.turnResp));
+  p.heading = wrapA(p.heading + p.turnRate * dt);
+  p.roll = p.turnRate * a.bank;
+  const [fx, fy] = fwd(p), sp = speedOf(p);
+  p.x = ((p.x + fx * sp * dt) % MAP + MAP) % MAP;
+  p.y = ((p.y + fy * sp * dt) % MAP + MAP) % MAP;
+  const wantVs = clamp((altTarget - p.alt) * 0.9, -a.climb * 0.6, a.climb);
+  p.vs += (wantVs - p.vs) * (1 - Math.exp(-dt * 2));
+  p.alt += p.vs * dt;
+  const g0 = groundAt(p.x, p.y);
+  if (p.alt < g0 + floor) { p.alt = g0 + floor; if (p.vs < 0) p.vs = 0; }
+  const wantHz = H * 0.38 + p.vs * 0.9;
+  p.horizon += (wantHz - p.horizon) * (1 - Math.exp(-dt * 3));
+}
+function terrainAhead(p, look) {
+  const [fx, fy] = fwd(p); let ahead = 0;
+  for (let k = 0; k <= 10; k++) { const d = look * k / 10; ahead = Math.max(ahead, groundAt(p.x + fx * d, p.y + fy * d)); }
+  return ahead;
+}
+
+// free-flight (calm demo) controller — same behaviour as the firmware
+function updatePlane(p, dt, manual, sx, sy) {
+  const a = AIRCRAFT[p.type];
+  let turn = p.turnTarget;
+  if (manual) turn = -sx * a.maxTurn;
+  else {
+    p.turnTimer -= dt;
+    if (p.turnTimer <= 0) {
+      turn = (frand(p) - 0.5) * 1.3 * a.maxTurn;
+      if (frand(p) < 0.3) turn = 0;
+      p.turnTimer = 2.5 + frand(p) * 4;
+    }
+  }
+  let target = terrainAhead(p, speedOf(p) * 4) + a.clearance;
+  if (manual) target += sy * 60;
+  flyPlane(p, dt, turn, target, 8);
+  p.altCmd = p.alt;
+}
+
+// ---------- camera & projection ----------
+const CHASE_BACK = 24, CHASE_UP = 11;
+function cameraFor(p, chase) {
+  const c = { x: p.x, y: p.y, alt: p.alt, heading: p.heading, roll: p.roll, horizon: p.horizon };
+  if (chase) {
+    c.x = p.x + Math.sin(p.heading) * CHASE_BACK;
+    c.y = p.y + Math.cos(p.heading) * CHASE_BACK;
+    c.alt = Math.max(p.alt + CHASE_UP, groundAt(c.x, c.y) + 6);
+    c.roll = p.roll * 0.4;
+  }
+  c.sin = Math.sin(c.heading); c.cos = Math.cos(c.heading);
+  return c;
+}
+// world → screen. Returns null if behind the camera.
+function project(cam, x, y, alt) {
+  const dx = wrapD(x - cam.x), dy = wrapD(y - cam.y);
+  const z = -dx * cam.sin - dy * cam.cos;
+  if (z < 1.5) return null;
+  const u = dx * cam.cos - dy * cam.sin;
+  const sx = W / 2 + u / z * (W / 2);
+  const sy = (cam.alt - alt) * HSCALE / z + cam.horizon + cam.roll * (sx - W / 2);
+  return { sx, sy, z };
+}
+const zq = z => Math.min(254, (z * 0.5) | 0);
+
+const ybuf = new Int16Array(W), rollOff = new Int32Array(W);
+function render(cam, fb) {
+  ybuf.fill(H);
+  const sinA = cam.sin, cosA = cam.cos, half = W / 2;
+  for (let i = 0; i < W; i++) rollOff[i] = (cam.roll * (i - half) * 256) | 0;
+  const hz256 = (cam.horizon * 256) | 0, camH = cam.alt | 0;
+  let z = 1, dz = 0.6;
+  while (z < DIST) {
+    const plx = -cosA * z - sinA * z + cam.x, ply = sinA * z - cosA * z + cam.y;
+    const prx = cosA * z - sinA * z + cam.x, pry = -sinA * z - cosA * z + cam.y;
+    let fx = (plx * 65536) | 0, fy = (ply * 65536) | 0;
+    const dx = ((prx - plx) * 65536 / W) | 0, dy = ((pry - ply) * 65536 / W) | 0;
+    const inv = (HSCALE / z * 256) | 0, zz = zq(z);
+    let fog = 0;
+    if (z > DIST * 0.3) fog = Math.min(FOG_LEVELS - 1, ((z - DIST * 0.3) / (DIST * 0.7) * (FOG_LEVELS - 1)) | 0);
+    const pal = fogLUT[fog];
+    for (let i = 0; i < W; i++) {
+      const idx = (((fy >> 16) & MAP_MASK) << MAP_BITS) | ((fx >> 16) & MAP_MASK);
+      let ys = ((camH - hmap[idx]) * inv + hz256 + rollOff[i]) >> 8;
+      if (ys < 0) ys = 0;
+      const yb = ybuf[i];
+      if (ys < yb) {
+        const c = pal[cmap[idx]];
+        for (let y = ys, o = ys * W + i; y < yb; y++, o += W) { fb[o] = c; zbuf[o] = zz; }
+        ybuf[i] = ys;
+      }
+      fx = (fx + dx) | 0; fy = (fy + dy) | 0;
+    }
+    z += dz; dz += 0.012;
+  }
+  for (let i = 0; i < W; i++) {
+    const hx = (hz256 + rollOff[i]) >> 8, yb = ybuf[i];
+    for (let y = 0, o = i; y < yb; y++, o += W) { fb[o] = skyLUT[Math.max(0, Math.min(255, 255 - (hx - y) * 2))]; zbuf[o] = 255; }
+  }
+}
+
+// ---------- depth-tested 2D primitives ----------
+const NX = [];
+function fillPoly(fb, xs, ys, n, c, d) {
+  let miny = Infinity, maxy = -Infinity;
+  for (let i = 0; i < n; i++) { if (ys[i] < miny) miny = ys[i]; if (ys[i] > maxy) maxy = ys[i]; }
+  const y0 = Math.max(0, Math.ceil(miny - 0.5)), y1 = Math.min(H - 1, Math.floor(maxy - 0.5));
+  for (let y = y0; y <= y1; y++) {
+    const sy = y + 0.5; NX.length = 0;
+    for (let i = 0, j = n - 1; i < n; j = i++)
+      if ((ys[i] <= sy) !== (ys[j] <= sy)) NX.push(xs[i] + (sy - ys[i]) * (xs[j] - xs[i]) / (ys[j] - ys[i]));
+    NX.sort((a, b) => a - b);
+    for (let k = 0; k + 1 < NX.length; k += 2) {
+      const xa = Math.max(0, Math.ceil(NX[k] - 0.5)), xb = Math.min(W - 1, Math.floor(NX[k + 1] - 0.5));
+      for (let x = xa, o = y * W + xa; x <= xb; x++, o++) if (d <= zbuf[o]) fb[o] = c;
+    }
+  }
+}
+function fillCircle(fb, cx, cy, r, c, d) {
+  if (r < 0.6) r = 0.6;
+  const y0 = Math.max(0, Math.floor(cy - r)), y1 = Math.min(H - 1, Math.ceil(cy + r));
+  for (let y = y0; y <= y1; y++) {
+    const dy = y + 0.5 - cy, w = r * r - dy * dy;
+    if (w < 0) continue;
+    const s = Math.sqrt(w), xa = Math.max(0, Math.ceil(cx - s - 0.5)), xb = Math.min(W - 1, Math.floor(cx + s - 0.5));
+    for (let x = xa, o = y * W + xa; x <= xb; x++, o++) if (d <= zbuf[o]) fb[o] = c;
+  }
+}
+function drawLine(fb, x0, y0, x1, y1, c, d) {
+  const n = Math.max(1, Math.ceil(Math.max(Math.abs(x1 - x0), Math.abs(y1 - y0))));
+  for (let i = 0; i <= n; i++) {
+    const x = Math.round(x0 + (x1 - x0) * i / n), y = Math.round(y0 + (y1 - y0) * i / n);
+    if (x < 0 || y < 0 || x >= W || y >= H) continue;
+    const o = y * W + x; if (d <= zbuf[o]) fb[o] = c;
+  }
+}
+const XS = new Array(16), YS = new Array(16);
+function drawShapes(fb, shapes, cx, cy, scale, ang, d, z, tint) {
+  const ca = Math.cos(ang) * scale, sa = Math.sin(ang) * scale;
+  for (const [col0, n0, q] of shapes) {
+    let col = col0;
+    if (tint) col = [col0[0] * 0.55 + tint[0] * 0.45, col0[1] * 0.55 + tint[1] * 0.45, col0[2] * 0.55 + tint[2] * 0.45];
+    const c = fogged(col, z);
+    let n = n0;
+    if (n0 < 0) {
+      n = scale > 0.6 ? 16 : 8;
+      for (let i = 0; i < n; i++) {
+        const t = i * Math.PI * 2 / n, lx = q[0] + Math.cos(t) * q[2], ly = q[1] + Math.sin(t) * q[3];
+        XS[i] = cx + lx * ca - ly * sa; YS[i] = cy + lx * sa + ly * ca;
+      }
+    } else for (let i = 0; i < n; i++) {
+      const lx = q[i * 2], ly = q[i * 2 + 1];
+      XS[i] = cx + lx * ca - ly * sa; YS[i] = cy + lx * sa + ly * ca;
+    }
+    fillPoly(fb, XS, YS, n, c, d);
+  }
+}
+// aim point: where the nose points, 90 units ahead.
+// (The world wraps every 256 units, so everything in combat stays within ~half of that.)
+const AIM_DIST = 90;
+function aimPoint(p, cam) {
+  const [fx, fy] = fwd(p);
+  return project(cam, p.x + fx * AIM_DIST, p.y + fy * AIM_DIST, p.alt + p.vs * AIM_DIST / speedOf(p) * 0.5);
+}
+
+// =====================================================================
+//  Dogfight
+// =====================================================================
+const BULLET_SPEED = 240, GUN_RANGE = 110, LOCK_RANGE = 125;
+const game = {
+  on: false, enemies: [], bullets: [], missiles: [], parts: [],
+  wave: 0, kills: 0, deaths: 0, hp: 100, dead: 0, gunCD: 0, missiles_left: 4, reload: 0,
+  lockTarget: null, lock: 0, msg: '', msgT: 0, hitFlash: 0, nextWave: 0, rng: 99,
+};
+const grand = () => { game.rng = (Math.imul(game.rng, 1664525) + 1013904223) >>> 0; return (game.rng >>> 8) / 16777216; };
+function say(m, t = 2) { game.msg = m; game.msgT = t; }
+
+function startDogfight() {
+  Object.assign(game, { on: true, enemies: [], bullets: [], missiles: [], parts: [], wave: 0, kills: 0, deaths: 0,
+                        hp: 100, dead: 0, missiles_left: 4, reload: 0, lockTarget: null, lock: 0, nextWave: 1.5,
+                        rng: (Math.random() * 4294967296) >>> 0 });
+  plane.altCmd = plane.alt;
+  say('FIGHT\'S ON!', 1.5);
+}
+function stopDogfight() { game.on = false; game.enemies = []; game.bullets = []; game.missiles = []; game.parts = []; }
+
+function spawnWave() {
+  game.wave++;
+  const n = Math.min(1 + game.wave, 5);
+  for (let i = 0; i < n; i++) {
+    const ang = grand() * Math.PI * 2, dist = 150 + grand() * 90;
+    const x = ((plane.x + Math.cos(ang) * dist) % MAP + MAP) % MAP, y = ((plane.y + Math.sin(ang) * dist) % MAP + MAP) % MAP;
+    const type = game.wave < 3 ? plane.type : (grand() * 3) | 0;   // later waves mix it up (no heli bandits)
+    const e = newPlane((grand() * 4294967296) >>> 0, type);
+    e.x = x; e.y = y; e.alt = Math.max(groundAt(x, y) + AIRCRAFT[type].clearance, plane.alt + (grand() - 0.5) * 30);
+    e.heading = Math.atan2(-wrapD(plane.x - x), -wrapD(plane.y - y)) + (grand() - 0.5);
+    e.speedMul = 0.85; e.hp = 100; e.gunCD = 0; e.mode = 'patrol'; e.modeT = 2 + grand() * 4; e.jink = 0; e.jinkT = 0; e.smokeT = 0;
+    game.enemies.push(e);
+  }
+  say('WAVE ' + game.wave + ' — ' + n + ' BANDIT' + (n > 1 ? 'S' : ''), 2.2);
+}
+
+function explode(x, y, alt, big) {
+  const n = big ? 22 : 6;
+  for (let i = 0; i < n; i++) {
+    const a = grand() * Math.PI * 2, s = (big ? 14 : 6) * (0.3 + grand());
+    game.parts.push({ x, y, alt, vx: Math.cos(a) * s, vy: Math.sin(a) * s, va: (grand() - 0.3) * s,
+                      r0: big ? 1.5 : 0.6, r1: big ? 4 + grand() * 3 : 1.6, t: 0, life: 0.5 + grand() * 0.6, kind: 'fire' });
+  }
+  if (big) for (let i = 0; i < 10; i++) {
+    const a = grand() * Math.PI * 2, s = 4 * grand();
+    game.parts.push({ x, y, alt, vx: Math.cos(a) * s, vy: Math.sin(a) * s, va: 3 + grand() * 4,
+                      r0: 2, r1: 6 + grand() * 4, t: 0, life: 1.6 + grand() * 1.2, kind: 'smoke' });
+  }
+}
+function puff(x, y, alt, r0, r1, life, kind = 'smoke') {
+  game.parts.push({ x, y, alt, vx: 0, vy: 0, va: 1, r0, r1, t: 0, life, kind });
+}
+
+function fireBullet(from, target, owner, spread) {
+  const [fx, fy] = fwd(from);
+  let hx = fx, hy = fy, va = from.vs * 0.6;
+  if (target) {                      // gunsight assist: aim at the target's lead position
+    const dx = wrapD(target.x - from.x), dy = wrapD(target.y - from.y), d = Math.hypot(dx, dy) || 1;
+    const tt = d / BULLET_SPEED, [tfx, tfy] = fwd(target), ts = speedOf(target);
+    const lx = dx + tfx * ts * tt, ly = dy + tfy * ts * tt, ld = Math.hypot(lx, ly) || 1;
+    // only bend the stream a little toward the lead point
+    const bend = 0.12;
+    hx = fx + clamp(lx / ld - fx, -bend, bend); hy = fy + clamp(ly / ld - fy, -bend, bend);
+    const hn = Math.hypot(hx, hy); hx /= hn; hy /= hn;
+    va = clamp((target.alt + target.vs * tt - from.alt) / tt, -60, 60);
+  }
+  const a = (grand() - 0.5) * spread, ca = Math.cos(a), sa = Math.sin(a);
+  const bx = hx * ca - hy * sa, by = hx * sa + hy * ca, sp = speedOf(from);
+  game.bullets.push({ x: from.x + bx * 3, y: from.y + by * 3, alt: from.alt - 0.5,
+                      vx: bx * BULLET_SPEED + fx * sp, vy: by * BULLET_SPEED + fy * sp, va: va + (grand() - 0.5) * spread * 40,
+                      life: 0.5, owner });
+}
+
+// best target near the aim point
+function pickTarget(cam) {
+  const aim = aimPoint(plane, cam);
+  let best = null, bestD = 1e9;
+  for (const e of game.enemies) {
+    const pr = project(cam, e.x, e.y, e.alt);
+    if (!pr || pr.z > LOCK_RANGE) continue;
+    const d = aim ? Math.hypot(pr.sx - aim.sx, pr.sy - aim.sy) : 1e9;
+    if (d < bestD) { bestD = d; best = { e, pr, d }; }
+  }
+  return best;
+}
+
+function updateDogfight(dt, cam, manual, sx, sy, gunHeld) {
+  const p = plane;
+  // ---- player ----
+  if (game.dead > 0) {
+    game.dead -= dt;
+    flyPlane(p, dt, 0.3, terrainAhead(p, 120) + 60, 8);
+    if (game.dead <= 0) { game.hp = 100; game.missiles_left = 4; p.altCmd = p.alt; say('BACK IN THE FIGHT', 1.5); }
+  } else {
+    const a = AIRCRAFT[p.type];
+    let turn, nearest = null;
+    if (manual) {
+      turn = -sx * a.maxTurn;
+      p.altCmd += sy * a.climb * 1.4 * dt;
+    } else {                       // assist: chase the nearest bandit
+      let nd = 1e9;
+      for (const e of game.enemies) { const d = Math.hypot(wrapD(e.x - p.x), wrapD(e.y - p.y)); if (d < nd) { nd = d; nearest = e; } }
+      if (nearest) {
+        const want = Math.atan2(-wrapD(nearest.x - p.x), -wrapD(nearest.y - p.y));
+        turn = wrapA(want - p.heading) * 2.5;
+        p.altCmd += clamp(nearest.alt - p.altCmd, -a.climb * dt, a.climb * dt);
+      } else turn = 0;
+    }
+    const floorAlt = terrainAhead(p, speedOf(p) * 3) + a.clearance * 0.5;
+    p.altCmd = clamp(p.altCmd, floorAlt, 330);
+    flyPlane(p, dt, turn, p.altCmd, 4);
+  }
+
+  // ---- lock-on ----
+  const t = game.dead > 0 ? null : pickTarget(cam);
+  if (t && t.d < 34) {
+    if (game.lockTarget !== t.e) { game.lockTarget = t.e; game.lock = 0; }
+    game.lock = Math.min(1, game.lock + dt / 0.9);
+  } else { game.lock = Math.max(0, game.lock - dt * 2); if (game.lock === 0) game.lockTarget = null; }
+
+  // ---- guns ----
+  game.gunCD -= dt;
+  const inSights = t && t.d < 18 && t.pr.z < GUN_RANGE;
+  if (game.dead <= 0 && (gunHeld || inSights) && game.gunCD <= 0) {
+    fireBullet(p, inSights ? t.e : null, 'me', 0.03);
+    game.gunCD = 0.075;
+  }
+
+  // ---- missile reload ----
+  if (game.missiles_left < 4) { game.reload += dt; if (game.reload > 8) { game.reload = 0; game.missiles_left++; } }
+
+  // ---- enemies ----
+  for (const e of game.enemies) {
+    const a = AIRCRAFT[e.type];
+    const dx = wrapD(p.x - e.x), dy = wrapD(p.y - e.y), dist = Math.hypot(dx, dy);
+    const want = Math.atan2(-dx, -dy), off = wrapA(want - e.heading);
+    e.modeT -= dt;
+    if (e.mode === 'attack' && dist < 22) { e.mode = 'extend'; e.modeT = 1.5 + grand() * 1.5; e.jink = grand() < 0.5 ? -1 : 1; }
+    if (e.modeT <= 0) {            // patrol → attack → patrol … with random timing
+      if (e.mode === 'attack' || e.mode === 'extend') { e.mode = 'patrol'; e.modeT = 4 + grand() * 5; }
+      else { e.mode = 'attack'; e.modeT = 5 + grand() * 5; }
+    }
+    e.jinkT -= dt;
+    if (e.jinkT <= 0) { e.jinkT = 1.5 + grand() * 2.5; e.jinkOff = (grand() - 0.5) * 0.8; }
+    let turn;
+    if (e.mode === 'extend') turn = e.jink * a.maxTurn;
+    else if (e.mode === 'patrol') turn = e.jinkOff * a.maxTurn * 0.6 + (dist > 110 ? off * 0.9 : 0);   // drift back toward the fight
+    else turn = clamp(off * 1.6 + (dist > 60 ? e.jinkOff * 0.5 : 0), -a.maxTurn * 0.75, a.maxTurn * 0.75);
+    const altT = Math.max(terrainAhead(e, speedOf(e) * 3) + a.clearance * 0.5, p.alt + (e.mode === 'extend' ? 25 : 0));
+    flyPlane(e, dt, turn, altT, 4);
+    if (e.hp < 50) { e.smokeT -= dt; if (e.smokeT <= 0) { e.smokeT = 0.06; puff(e.x, e.y, e.alt, 0.6, 2.5, 0.9); } }
+    // shoot back
+    e.gunCD -= dt;
+    if (game.dead <= 0 && e.mode === 'attack' && Math.abs(off) < 0.12 && dist < 170 && Math.abs(p.alt - e.alt) < 25 && e.gunCD <= 0) {
+      fireBullet(e, p, 'bandit', 0.09);
+      e.gunCD = 0.11 + grand() * 0.08;
+    }
+    // collision with player
+    if (game.dead <= 0 && dist < 4 && Math.abs(p.alt - e.alt) < 4) { e.hp = 0; damagePlayer(100); }
+  }
+
+  // ---- bullets ----
+  for (const b of game.bullets) {
+    b.x = ((b.x + b.vx * dt) % MAP + MAP) % MAP; b.y = ((b.y + b.vy * dt) % MAP + MAP) % MAP; b.alt += b.va * dt;
+    b.life -= dt;
+    if (b.alt < groundAt(b.x, b.y)) { b.life = 0; if (grand() < 0.3) puff(b.x, b.y, b.alt + 0.5, 0.4, 1.2, 0.4, 'dust'); continue; }
+    if (b.owner === 'me') {
+      for (const e of game.enemies) {
+        if (Math.hypot(wrapD(e.x - b.x), wrapD(e.y - b.y)) < 5 && Math.abs(e.alt - b.alt) < 4) {
+          e.hp -= 12; b.life = 0; explode(b.x, b.y, b.alt, false); break;
+        }
+      }
+    } else if (game.dead <= 0 && Math.hypot(wrapD(p.x - b.x), wrapD(p.y - b.y)) < 4 && Math.abs(p.alt - b.alt) < 3.5) {
+      b.life = 0; damagePlayer(4);
+    }
+  }
+  game.bullets = game.bullets.filter(b => b.life > 0);
+
+  // ---- missiles ----
+  for (const m of game.missiles) {
+    m.life -= dt;
+    const tg = m.target && game.enemies.includes(m.target) ? m.target : null;
+    if (tg) {
+      const want = Math.atan2(-wrapD(tg.x - m.x), -wrapD(tg.y - m.y));
+      m.heading = wrapA(m.heading + clamp(wrapA(want - m.heading), -2.6 * dt, 2.6 * dt));
+      m.va = clamp((tg.alt - m.alt) * 3, -90, 90);
+    }
+    m.speed = Math.min(150, m.speed + 120 * dt);
+    m.x = ((m.x - Math.sin(m.heading) * m.speed * dt) % MAP + MAP) % MAP;
+    m.y = ((m.y - Math.cos(m.heading) * m.speed * dt) % MAP + MAP) % MAP;
+    m.alt += m.va * dt;
+    m.smokeT -= dt;
+    if (m.smokeT <= 0) { m.smokeT = 0.025; puff(m.x, m.y, m.alt, 0.5, 2.2, 1.1); }
+    if (tg && Math.hypot(wrapD(tg.x - m.x), wrapD(tg.y - m.y)) < 6 && Math.abs(tg.alt - m.alt) < 6) {
+      tg.hp = 0; m.life = 0;
+    }
+    if (m.alt < groundAt(m.x, m.y)) { m.life = 0; explode(m.x, m.y, m.alt, true); }
+    if (m.life <= 0 && m.life > -1) explode(m.x, m.y, m.alt, false);
+  }
+  game.missiles = game.missiles.filter(m => m.life > 0);
+
+  // ---- deaths ----
+  for (const e of game.enemies) if (e.hp <= 0) {
+    explode(e.x, e.y, e.alt, true);
+    game.kills++;
+    const left = game.enemies.filter(o => o.hp > 0).length;
+    say(left ? ['SPLASH ONE!', 'GOOD KILL!', 'BANDIT DOWN!'][(grand() * 3) | 0] : 'WAVE ' + game.wave + ' CLEARED!', 1.6);
+    if (game.lockTarget === e) { game.lockTarget = null; game.lock = 0; }
+  }
+  game.enemies = game.enemies.filter(e => e.hp > 0);
+  if (!game.enemies.length) {
+    game.nextWave -= dt;
+    if (game.nextWave <= 0) { spawnWave(); game.nextWave = 2.5; }
+  }
+
+  // ---- particles ----
+  for (const q of game.parts) { q.t += dt; q.x += q.vx * dt; q.y += q.vy * dt; q.alt += q.va * dt; q.vx *= 0.97; q.vy *= 0.97; }
+  game.parts = game.parts.filter(q => q.t < q.life);
+  if (game.parts.length > 600) game.parts.splice(0, game.parts.length - 600);
+
+  game.msgT -= dt; game.hitFlash = Math.max(0, game.hitFlash - dt * 3);
+}
+
+function damagePlayer(n) {
+  if (game.dead > 0) return;
+  game.hp -= n; game.hitFlash = 1;
+  if (game.hp <= 0) {
+    game.hp = 0; game.deaths++; game.dead = 2.5;
+    explode(plane.x, plane.y, plane.alt, true);
+    say('SHOT DOWN!', 2.4);
+  }
+}
+
+function fireMissile() {
+  if (!game.on || game.dead > 0 || game.missiles_left <= 0) return;
+  const locked = game.lock >= 1 ? game.lockTarget : null;
+  game.missiles_left--;
+  game.missiles.push({ x: plane.x, y: plane.y, alt: plane.alt - 1.5, heading: plane.heading, speed: speedOf(plane) + 20,
+                       va: 0, life: 5, target: locked, smokeT: 0 });
+  if (!locked) say('NO LOCK', 0.8);
+}
+
+function partColor(q) {
+  const k = q.t / q.life;
+  if (q.kind === 'fire') {
+    if (k < 0.35) return [255, 235 - k * 200, 140 - k * 300];
+    return [255 - (k - 0.35) * 260, 120 - (k - 0.35) * 120, 40];
+  }
+  if (q.kind === 'dust') return [150, 130, 100];
+  const g = 200 - k * 70; return [g, g, g + 5];
+}
+
+function drawWorldObjects(fb, cam, chase) {
+  const list = [];
+  for (const e of game.enemies) { const pr = project(cam, e.x, e.y, e.alt); if (pr) list.push([pr, 'e', e]); }
+  for (const m of game.missiles) { const pr = project(cam, m.x, m.y, m.alt); if (pr) list.push([pr, 'm', m]); }
+  for (const q of game.parts) { const pr = project(cam, q.x, q.y, q.alt); if (pr) list.push([pr, 'p', q]); }
+  for (const b of game.bullets) { const pr = project(cam, b.x, b.y, b.alt); if (pr) list.push([pr, 'b', b]); }
+  list.sort((a, b) => b[0].z - a[0].z);
+  const scaleK = CHASE_BACK * 1.7, pxPerUnit = W / 2;   // bandits drawn 1.7x for readability
+  for (const [pr, kind, o] of list) {
+    const d = zq(pr.z);
+    if (kind === 'e') {
+      const a = AIRCRAFT[o.type], ang = -Math.atan(o.roll) * a.spriteBank + Math.atan(cam.roll);
+      drawShapes(fb, a.shapes, pr.sx, pr.sy, scaleK / pr.z, ang, d, pr.z, BANDIT_TINT);
+    } else if (kind === 'm') {
+      fillCircle(fb, pr.sx, pr.sy, Math.max(1, 0.8 * pxPerUnit / pr.z), fogged([255, 255, 230], pr.z), d);
+    } else if (kind === 'p') {
+      const r = (o.r0 + (o.r1 - o.r0) * (o.t / o.life)) * pxPerUnit / pr.z * 0.5;
+      fillCircle(fb, pr.sx, pr.sy, r, fogged(partColor(o), pr.z), d);
+    } else {
+      const tail = project(cam, o.x - o.vx * 0.025, o.y - o.vy * 0.025, o.alt - o.va * 0.025);
+      const c = fogged(o.owner === 'me' ? [255, 240, 120] : [255, 90, 70], pr.z);
+      if (tail) drawLine(fb, pr.sx, pr.sy, tail.sx, tail.sy, c, d);
+      else fillCircle(fb, pr.sx, pr.sy, 0.8, c, d);
+    }
+  }
+}
+
+// =====================================================================
+//  Frame drawing
+// =====================================================================
+function drawFrame(p, chase, fb) {
+  const cam = cameraFor(p, chase);
+  render(cam, fb);
+  if (game.on) drawWorldObjects(fb, cam, chase);
+  if (chase && !(game.on && game.dead > 0)) {
+    const a = AIRCRAFT[p.type], ang = -Math.atan(p.roll) * a.spriteBank;
+    const cx = W / 2, cy = cam.horizon + (cam.alt - p.alt) * HSCALE / CHASE_BACK - p.vs * 0.15;
+    drawShapes(fb, a.shapes, cx, cy, 1, ang, zq(CHASE_BACK) , 0, null);
+  }
+  if (!chase && !game.on) {
+    const c = rgb(120, 255, 120), cx = W / 2, cy = (H * 0.38) | 0;
+    for (let d = 4; d <= 12; d++) { fb[cy * W + cx - d] = c; fb[cy * W + cx + d] = c; }
+    for (let d = 3; d <= 6; d++) fb[(cy + d) * W + cx] = c;
+  }
+  return cam;
+}
+
+function drawHUD(ctx, cam, manual, fps) {
+  ctx.font = '8px monospace'; ctx.textBaseline = 'top'; ctx.fillStyle = '#fff';
+  ctx.fillText('ALT ' + String((plane.alt | 0) * 10).padStart(4), 4, 4);
+  const hdg = (((-plane.heading * 57.2958) % 360) + 360) % 360;
+  ctx.fillText('HDG ' + String(hdg | 0).padStart(3, '0'), 4, 14);
+  ctx.fillText(AIRCRAFT[plane.type].name, 4, H - 11);
+  if (!game.on) {
+    ctx.fillText(String(Math.round(fps)).padStart(2) + ' FPS', W - 46, 4);
+    ctx.fillText(manual ? (tiltOn && !dragging && !keys.size ? 'TILT' : 'MAN') : 'AUTO', W - 46, 14);
+    return;
+  }
+  // gunsight
+  const aim = game.dead > 0 ? null : aimPoint(plane, cam);
+  if (aim) {
+    ctx.strokeStyle = 'rgba(120,255,120,0.9)'; ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.arc(aim.sx, aim.sy, 6, 0, Math.PI * 2); ctx.stroke();
+    ctx.fillStyle = 'rgba(120,255,120,0.9)'; ctx.fillRect(aim.sx - 0.5, aim.sy - 0.5, 1, 1);
+  }
+  // lock box
+  if (game.lockTarget && game.dead <= 0) {
+    const pr = project(cam, game.lockTarget.x, game.lockTarget.y, game.lockTarget.alt);
+    if (pr) {
+      const locked = game.lock >= 1, s = locked ? 9 : 20 - game.lock * 11;
+      ctx.strokeStyle = locked ? '#ff4040' : '#ffd740'; ctx.lineWidth = 1;
+      ctx.strokeRect(Math.round(pr.sx - s) + 0.5, Math.round(pr.sy - s) + 0.5, s * 2, s * 2);
+      if (locked) { ctx.fillStyle = '#ff4040'; ctx.fillText('LOCK', pr.sx - 9, pr.sy + s + 2); }
+      ctx.fillStyle = '#ffd740'; ctx.fillText(String((pr.z * 10) | 0), pr.sx + s + 2, pr.sy - 4);
+    }
+  }
+  // health
+  ctx.fillStyle = 'rgba(0,0,0,0.45)'; ctx.fillRect(W / 2 - 31, 4, 62, 6);
+  ctx.fillStyle = game.hp > 50 ? '#5cdb5c' : game.hp > 25 ? '#ffc940' : '#ff4a3a';
+  ctx.fillRect(W / 2 - 30, 5, 60 * game.hp / 100, 4);
+  // score & weapons
+  ctx.fillStyle = '#fff';
+  ctx.fillText('KILLS ' + game.kills, W - 52, 4);
+  ctx.fillText('WAVE ' + game.wave, W - 52, 14);
+  ctx.fillText('MSL ' + '▮'.repeat(game.missiles_left) + '▯'.repeat(4 - game.missiles_left), 4, H - 21);
+  // radar
+  const R = 22, rx = W - R - 4, ry = H - R - 4;
+  ctx.fillStyle = 'rgba(0,30,0,0.55)'; ctx.beginPath(); ctx.arc(rx, ry, R, 0, Math.PI * 2); ctx.fill();
+  ctx.strokeStyle = 'rgba(120,255,120,0.6)'; ctx.stroke();
+  ctx.fillStyle = '#7f7'; ctx.fillRect(rx - 1, ry - 1, 2, 2);
+  const s = Math.sin(plane.heading), c = Math.cos(plane.heading);
+  for (const e of game.enemies) {
+    const dx = wrapD(e.x - plane.x), dy = wrapD(e.y - plane.y);
+    const f = -dx * s - dy * c, r = dx * c - dy * s, k = R / 128;
+    let px = r * k, py = -f * k; const m = Math.hypot(px, py);
+    if (m > R - 2) { px *= (R - 2) / m; py *= (R - 2) / m; }
+    ctx.fillStyle = e === game.lockTarget && game.lock >= 1 ? '#ff4040' : '#ff8a65';
+    ctx.fillRect(rx + px - 1.5, ry + py - 1.5, 3, 3);
+  }
+  // hit flash & message
+  if (game.hitFlash > 0) { ctx.strokeStyle = `rgba(255,40,40,${game.hitFlash * 0.8})`; ctx.lineWidth = 6; ctx.strokeRect(0, 0, W, H); ctx.lineWidth = 1; }
+  if (game.msgT > 0) {
+    ctx.font = 'bold 12px monospace'; ctx.textAlign = 'center';
+    ctx.fillStyle = 'rgba(0,0,0,0.55)'; ctx.fillText(game.msg, W / 2 + 1, 41);
+    ctx.fillStyle = '#ffe680'; ctx.fillText(game.msg, W / 2, 40);
+    ctx.textAlign = 'start'; ctx.font = '8px monospace';
+  }
+}
+
+// =====================================================================
+//  App
+// =====================================================================
+const IS_BROWSER = typeof document !== 'undefined';
+let plane, seed, aircraftType = 1, chase = true;
+let tiltOn = false, tilt0 = null, tiltRaw = null, tiltListening = false;
+let dragging = false, dragX0 = 0, dragY0 = 0, dragSX = 0, dragSY = 0;
+const keys = new Set();
+let gunHeld = false;
+
+function startWorld() {
+  seed = (Math.random() * 4294967296) >>> 0;
+  generateWorld(seed);
+  plane = newPlane(seed, aircraftType);
+  if (game.on) startDogfight();
+}
+
+if (IS_BROWSER) {
+  const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+  const img = ctx.createImageData(W, H), fb = new Uint32Array(img.data.buffer);
+  let last = performance.now(), fps = 30, sx = 0, sy = 0;
+
+  const readTilt = () => {
+    if (!tiltRaw) return null;
+    const a = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
+    const { beta, gamma } = tiltRaw;
+    if (a === 90) return { x: beta, y: -gamma };
+    if (a === -90 || a === 270) return { x: -beta, y: gamma };
+    return { x: gamma, y: beta };
+  };
+  const setLevel = () => { tilt0 = readTilt(); };
+
+  function frame(t) {
+    const dt = Math.min(0.05, (t - last) / 1000); last = t;
+    if (dt > 0) fps += (1 / dt - fps) * 0.05;
+    let tx = 0, ty = 0, manual = false;
+    if (tiltOn && tiltRaw) {
+      const r = readTilt(); if (!tilt0) tilt0 = r;
+      tx = (r.x - tilt0.x) / 30; ty = -(r.y - tilt0.y) / 30; manual = true;
+    }
+    if (dragging) { tx = dragSX; ty = dragSY; manual = true; }
+    if (keys.has('ArrowLeft') || keys.has('ArrowRight') || keys.has('ArrowUp') || keys.has('ArrowDown')) {
+      tx = (keys.has('ArrowRight') ? 1 : 0) - (keys.has('ArrowLeft') ? 1 : 0);
+      ty = (keys.has('ArrowUp') ? 1 : 0) - (keys.has('ArrowDown') ? 1 : 0);
+      manual = true;
+    }
+    tx = clamp(tx, -1, 1); ty = clamp(ty, -1, 1);
+    sx += (tx - sx) * 0.3; sy += (ty - sy) * 0.3;
+
+    if (game.on) {
+      const camNow = cameraFor(plane, chase);
+      updateDogfight(dt, camNow, manual, sx, sy, gunHeld || keys.has(' '));
+    } else updatePlane(plane, dt, manual, sx, sy);
+
+    const cam = drawFrame(plane, chase, fb);
+    ctx.putImageData(img, 0, 0);
+    drawHUD(ctx, cam, manual, fps);
+    document.getElementById('auto').classList.toggle('on', !manual);
+    requestAnimationFrame(frame);
+  }
+
+  const stickFromDrag = e => {
+    const r = cv.getBoundingClientRect(), s = r.width / 3;
+    dragSX = (e.clientX - dragX0) / s; dragSY = -(e.clientY - dragY0) / s;
+  };
+  cv.addEventListener('pointerdown', e => {
+    if (tiltOn) { setLevel(); return; }
+    dragging = true; dragX0 = e.clientX; dragY0 = e.clientY; dragSX = dragSY = 0;
+    cv.setPointerCapture(e.pointerId);
+  });
+  cv.addEventListener('pointermove', e => { if (dragging) stickFromDrag(e); });
+  const endDrag = () => { dragging = false; };
+  cv.addEventListener('pointerup', endDrag); cv.addEventListener('pointercancel', endDrag);
+
+  const craftRow = document.getElementById('craft');
+  const label = { JET: 'Jet', PROP: 'Prop plane', BIPLANE: 'Biplane', HELI: 'Helicopter' };
+  AIRCRAFT.forEach((a, i) => {
+    const b = document.createElement('button');
+    b.textContent = label[a.name]; b.classList.toggle('on', i === aircraftType);
+    b.onclick = () => { aircraftType = plane.type = i; [...craftRow.children].forEach((c, j) => c.classList.toggle('on', j === i)); };
+    craftRow.appendChild(b);
+  });
+  const viewBtn = document.getElementById('view');
+  viewBtn.onclick = () => { chase = !chase; viewBtn.textContent = chase ? 'Chase view' : 'Cockpit view'; viewBtn.classList.toggle('on', chase); };
+  document.getElementById('newWorld').onclick = startWorld;
+  document.getElementById('auto').onclick = () => { tiltOn = false; document.getElementById('tilt').classList.remove('on'); };
+
+  const fightBtn = document.getElementById('fight'), weapons = document.getElementById('weapons');
+  fightBtn.onclick = () => {
+    if (game.on) { stopDogfight(); fightBtn.classList.remove('on'); fightBtn.textContent = '⚔ Dogfight'; weapons.style.display = 'none'; }
+    else { startDogfight(); fightBtn.classList.add('on'); fightBtn.textContent = '✕ End dogfight'; weapons.style.display = 'flex'; }
+  };
+  const fireBtn = document.getElementById('fire');
+  const hold = on => e => { e.preventDefault(); gunHeld = on; fireBtn.classList.toggle('held', on); };
+  fireBtn.addEventListener('pointerdown', hold(true));
+  ['pointerup', 'pointercancel', 'pointerleave'].forEach(ev => fireBtn.addEventListener(ev, hold(false)));
+  document.getElementById('missile').addEventListener('pointerdown', e => { e.preventDefault(); fireMissile(); });
+
+  addEventListener('keydown', e => {
+    if (e.key.startsWith('Arrow') || e.key === ' ') { keys.add(e.key); e.preventDefault(); }
+    if (e.key === 'n') startWorld();
+    if (e.key === 'v') viewBtn.click();
+    if (e.key === 'm' || e.key === 'Enter') fireMissile();
+    if (e.key === 'f') fightBtn.click();
+    if (e.key >= '1' && e.key <= '4') craftRow.children[+e.key - 1].click();
+  });
+  addEventListener('keyup', e => keys.delete(e.key));
+
+  document.getElementById('tilt').onclick = async () => {
+    const btn = document.getElementById('tilt');
+    if (tiltOn) { tiltOn = false; btn.classList.remove('on'); return; }
+    try {
+      if (typeof DeviceOrientationEvent !== 'undefined' && typeof DeviceOrientationEvent.requestPermission === 'function') {
+        if (await DeviceOrientationEvent.requestPermission() !== 'granted') { btn.textContent = 'Tilt: permission denied'; return; }
+      }
+    } catch (err) { btn.textContent = 'Tilt not available'; return; }
+    if (!('DeviceOrientationEvent' in window)) { btn.textContent = 'No tilt sensor'; return; }
+    if (!tiltListening) { tiltListening = true; addEventListener('deviceorientation', e => { if (e.beta != null) tiltRaw = { beta: e.beta, gamma: e.gamma }; }); }
+    tiltOn = true; tilt0 = null; btn.classList.add('on');
+    setTimeout(() => { if (!tiltRaw) { btn.textContent = 'No tilt sensor'; tiltOn = false; btn.classList.remove('on'); } }, 1500);
+  };
+
+  buildPalettes();
+  startWorld();
+  requestAnimationFrame(frame);
+}
+</script>
+</body>
+</html>
